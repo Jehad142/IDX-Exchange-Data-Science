@@ -384,10 +384,10 @@ def clean_property_characteristics(df):
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
     # Define provisional valid ranges for property counts
-    valid_ranges = {"BedroomsTotal": (0, 20),
+    valid_ranges = {"BedroomsTotal": (1, 20),
                     "BathroomsTotalInteger": (1, 20),
                     "GarageSpaces": (0, 20),
-                    "ParkingTotal": (0, 100)}
+                    "ParkingTotal": (0, 20)}
 
     invalid_logs = {}
 
