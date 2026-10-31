@@ -1,4 +1,5 @@
 import pandas as pd
+import geopandas as gpd
 from pathlib import Path
 import numpy as np
 from sklearn.preprocessing import TargetEncoder
@@ -427,4 +428,56 @@ def clean_categorical_features(df):
 
     return df
 
+def add_bed_bath_ratio(df):
+    """Create a bedroom-to-bathroom ratio feature.
 
+    Args:
+        df (pd.DataFrame): Contains property records.
+        
+    Returns:
+        pd.DataFrame: DataFrame with the new BedBathRatio feature.
+    """
+    df = df.copy()
+
+    # Calculate the bedroom to bathroom ratio
+    df["BedBathRatio"] = df["BedroomsTotal"] / df["BathroomsTotalInteger"]
+
+    return df
+
+
+def add_school_district_features(df, elementary_districts, high_school_districts):
+
+    df = df.copy()
+
+    # Preserve original index and create a unique index for each property
+    original_index = df.index
+    df = df.reset_index(drop=True)
+
+    # Convert property coordinates into geographic points
+    properties_geo = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df["Longitude"], df["Latitude"]), crs="EPSG:4326")
+
+    # Join elementary school districts
+    properties_geo = gpd.sjoin(properties_geo, elementary_districts, how="left", predicate="within")
+
+    # Prioritize Elementary over Unified and keep one match per property
+    properties_geo = properties_geo.sort_values(["DistrictType", "ElementarySchoolDistrict"])
+    properties_geo = properties_geo[~properties_geo.index.duplicated(keep="first")]
+
+    # Remove temporary columns before the next join
+    properties_geo = properties_geo.drop(columns=["index_right", "DistrictType"])
+
+    # Join high school districts
+    properties_geo = gpd.sjoin(properties_geo, high_school_districts, how="left", predicate="within")
+
+    # Prioritize High over Unified and keep one match per property
+    properties_geo = properties_geo.sort_values(["DistrictType", "HighSchoolDistrict"])
+    properties_geo = properties_geo[~properties_geo.index.duplicated(keep="first")]
+
+    # Restore original row order and index
+    properties_geo = properties_geo.sort_index()
+    properties_geo.index = original_index
+
+    # Remove geographic and temporary columns
+    properties_geo = properties_geo.drop(columns=["geometry", "index_right", "DistrictType"])
+
+    return pd.DataFrame(properties_geo)
