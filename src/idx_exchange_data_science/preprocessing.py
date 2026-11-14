@@ -1,9 +1,8 @@
 import pandas as pd
 import geopandas as gpd
-from pathlib import Path
 import numpy as np
-from sklearn.preprocessing import TargetEncoder
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.neighbors import BallTree
 
 
 
@@ -92,8 +91,7 @@ def initial_cleaning(df):
     # Remove missing or invalid target values
     before = len(df)
 
-    df = df[df["ClosePrice"].notna() &
-            (df["ClosePrice"] > 0)].copy()
+    df = df[df["ClosePrice"].notna() & (df["ClosePrice"] > 0)].copy()
 
     log_step("Target cleaning", before)
 
@@ -116,10 +114,8 @@ def select_training_window(df, n_months, validation_month):
     months = pd.PeriodIndex(df["SourceMonth"], freq="M")
     validation_month = pd.Period(validation_month, freq="M")
 
-    mask = (
-        (months >= validation_month - n_months) &
-        (months < validation_month)
-    )
+    mask = ((months >= validation_month - n_months) & (months < validation_month))
+    
     return df.loc[mask].copy()
 
 
@@ -192,8 +188,7 @@ def clean_lot_size(df):
 
     # Recover missing square footage using acres
     recovered_rows = missing_lotsize_sqft.sum()
-    df.loc[missing_lotsize_sqft , "LotSizeSquareFeet"] = ( 
-           df.loc[missing_lotsize_sqft, "LotSizeAcres"] * 43560)
+    df.loc[missing_lotsize_sqft , "LotSizeSquareFeet"] = (df.loc[missing_lotsize_sqft, "LotSizeAcres"] * 43560)
 
     # Drop the redundant acreage feature
     df = df.drop(columns=["LotSizeAcres"])
@@ -238,16 +233,10 @@ def clean_coordinates(df):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     
     # Identify latitude values outside CA bounds
-    invalid_latitude = (
-        df["Latitude"].notna() &
-        ~df["Latitude"].between(32.5, 42.1)
-    )
+    invalid_latitude = (df["Latitude"].notna() & ~df["Latitude"].between(32.5, 42.1))
 
     # Identify longitude values outside CA bounds
-    invalid_longitude = (
-        df["Longitude"].notna() &
-        ~df["Longitude"].between(-124.5, -114.0)
-    )
+    invalid_longitude = (df["Longitude"].notna() & ~df["Longitude"].between(-124.5, -114.0))
 
     # Mark both coordinates missing if either is invalid
     invalid_pair = invalid_latitude | invalid_longitude
@@ -301,25 +290,16 @@ class CoordinateImputer(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
         coordinates = ["Latitude", "Longitude"]
 
-        self.zip_medians_ = (
-            X.groupby("PostalCode")[coordinates].median()
-        )
+        self.zip_medians_ = (X.groupby("PostalCode")[coordinates].median())
 
-        self.county_medians_ = (
-            X.groupby("CountyOrParish")[coordinates].median()
-        )
+        self.county_medians_ = (X.groupby("CountyOrParish")[coordinates].median())
 
         self.overall_medians_ = X[coordinates].median()
 
         return self
 
     def transform(self, X):
-        imputed_df, _ = impute_coordinates(
-            X,
-            self.zip_medians_,
-            self.county_medians_,
-            self.overall_medians_,
-        )
+        imputed_df, _ = impute_coordinates(X, self.zip_medians_, self.county_medians_,self.overall_medians_)
 
         return imputed_df
 
@@ -421,10 +401,7 @@ def clean_categorical_features(df):
     categorical_columns = ["City", "CountyOrParish", "PostalCode"]
 
     for column in categorical_columns:
-        df[column] = df[column].fillna("Unknown")\
-                               .astype(str)\
-                               .str.strip()
-        
+        df[column] = df[column].fillna("Unknown").astype(str).str.strip()
 
     return df
 
@@ -463,8 +440,11 @@ def add_school_district_features(df, elementary_districts, high_school_districts
     properties_geo = properties_geo.sort_values(["DistrictType", "ElementarySchoolDistrict"])
     properties_geo = properties_geo[~properties_geo.index.duplicated(keep="first")]
 
+    # Add socioeconomic disadvantage percentage
+    properties_geo["DistrictSEDPct"] = pd.to_numeric(properties_geo["SEDpct"], errors="coerce")
+
     # Remove temporary columns before the next join
-    properties_geo = properties_geo.drop(columns=["index_right", "DistrictType"])
+    properties_geo = properties_geo.drop(columns=["index_right", "DistrictType", "SEDpct"])
 
     # Join high school districts
     properties_geo = gpd.sjoin(properties_geo, high_school_districts, how="left", predicate="within")
@@ -481,3 +461,130 @@ def add_school_district_features(df, elementary_districts, high_school_districts
     properties_geo = properties_geo.drop(columns=["geometry", "index_right", "DistrictType"])
 
     return pd.DataFrame(properties_geo)
+
+def add_hoa_features(df):
+    """Create HOA features from association fees. 
+
+    Args:
+        df (pd.DataFrame): Contains property records.
+
+    Returns:
+        pd.DataFrame: Dataset with monthly HOA fees,
+    """
+    df = df.copy()
+
+    # Convert association fees to numeric
+    df["AssociationFee"] = pd.to_numeric(df["AssociationFee"], errors="coerce")
+
+    # Convert payment frequencies to monthly equivalents
+    frequency_multiplier = { "Monthly": 1.0, "Quarterly": 1/3, "SemiAnnually": 1/6, "Annually": 1/12 }
+
+    # Calculate monthly HOA fees
+    df["fee_monthly"] = (df["AssociationFee"] * df["AssociationFeeFrequency"].map(frequency_multiplier))
+
+    # Create missing-value indicator
+    df["AssociationFee_missing"] = (df["fee_monthly"].isna().astype(int))
+
+    # Create binary indicator for HOA presence
+    df["HasHOA"] = (df["fee_monthly"] > 0).astype(int)
+    df = df.drop(columns=["AssociationFee", "AssociationFeeFrequency"], errors="ignore")
+
+    return df
+
+def add_comparable_sales(df, history, k=5, lookback_months=6):
+    """Create comparable-sales features from earlier property sales.
+
+    Args:
+        df (pd.DataFrame): Properties to generate features for.
+        history (pd.DataFrame): Historical properties with closing prices.
+        k (int): Number of nearest comparable sales.
+        lookback_months (int): Number of previous months to consider.
+
+    Returns:
+        pd.DataFrame: Dataset with comparable-sales features.
+    """
+    df = df.copy()
+    history = history.copy()
+
+    # Convert dates
+    df["ListingContractDate"] = pd.to_datetime(df["ListingContractDate"], errors="coerce")
+    history["CloseDate"] = pd.to_datetime(history["CloseDate"], errors="coerce")
+
+    # Calculate price per square foot for historical sales
+    history["PricePerSqft"] = (history["ClosePrice"] / history["LivingArea"].where(history["LivingArea"] > 0))
+
+    # Keep historical sales with valid values
+    history = history[history["Latitude"].between(-90, 90) & history["Longitude"].between(-180, 180)
+                      & (history["PricePerSqft"] > 0) & history["CloseDate"].notna()].copy()
+
+    # Initialize comparable features
+    df["LogCompPricePerSqft"] = np.nan
+    df["LogCompImpliedPrice"] = np.nan
+    df["CompDistanceKm"] = np.nan
+
+    earth_radius_km = 6371.0
+
+    # Generate comparable features for each listing month
+    listing_month = df["ListingContractDate"].dt.to_period("M")
+    close_month = history["CloseDate"].dt.to_period("M")
+
+    for month in listing_month.dropna().unique():
+
+        # Select sales that closed before the listing month
+        earlier = ((close_month < month) & (close_month >= month - lookback_months))
+
+        past_sales = history[earlier]
+
+        if len(past_sales) < k:
+            continue
+
+        # Build spatial tree using historical coordinates
+        tree = BallTree(np.radians(past_sales[["Latitude", "Longitude"]].to_numpy()), metric="haversine")
+
+        # Select properties listed in the current month
+        homes = ((listing_month == month) & df["Latitude"].between(-90, 90)
+                 & df["Longitude"].between(-180, 180) & (df["LivingArea"] > 0))
+
+        if not homes.any():
+            continue
+
+        # Find k nearest comparable sales
+        distances, indices = tree.query(np.radians(df.loc[homes, ["Latitude", "Longitude"]].to_numpy()), k=k)
+
+        # Calculate median comparable price per square foot
+        comp_ppsf = np.median(past_sales["PricePerSqft"].to_numpy()[indices], axis=1)
+
+        # Add comparable-sales features
+        df.loc[homes, "LogCompPricePerSqft"] = np.log(comp_ppsf)
+
+        df.loc[homes, "LogCompImpliedPrice"] = np.log(comp_ppsf * df.loc[homes, "LivingArea"].to_numpy())
+
+        df.loc[homes, "CompDistanceKm"] = (distances.mean(axis=1) * earth_radius_km)
+
+    return df
+
+def add_flooring_features(df):
+    """Create flooring material and missing-value indicators.
+
+    Args:
+        df (pd.DataFrame): Contains property records.
+
+    Returns:
+        pd.DataFrame: Dataset with flooring features.
+    """
+    df = df.copy()
+
+    # Create flooring material indicators
+    flooring = df["Flooring"].fillna("")
+
+    for material in ["Wood", "Tile", "Carpet", "Laminate", "Vinyl"]:
+        df[f"Has{material}Flooring"] = (flooring.str.contains(material, case=False, regex=False).astype(int))
+
+    # Create indicator for flooring information in remarks
+    df["Flooring_SeeRemarks"] = (flooring.str.contains("SeeRemarks", case=False, regex=False).astype(int))
+
+    # Create missing-value indicator
+    df["Flooring_missing"] = df["Flooring"].isna().astype(int)
+
+    return df
+
