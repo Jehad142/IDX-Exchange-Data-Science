@@ -1,0 +1,16 @@
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+
+# Environments
+.env
+.venv/
+
+# Data
+data/
+
+# Saved trained models
+models/*.joblib
