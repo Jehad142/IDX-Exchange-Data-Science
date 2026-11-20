@@ -12,5 +12,14 @@ __pycache__/
 # Data
 data/
 
+# Streamlit test data
+results/streamlit_test_actual_prices.csv
+results/streamlit_test_addresses.csv
+results/streamlit_test_features.csv
+
+
 # Saved trained models
 models/*.joblib
+
+# macOS files
+.DS_Store
